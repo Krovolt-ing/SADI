@@ -2,27 +2,20 @@ import requests
 import pandas as pd
 import os
 from datetime import datetime
+import numpy as np
 
 FILE_NAME = "sadi_historico.csv"
 BASE_URL = "https://api.cammesa.com/demanda-svc/"
 
-# 1. LISTADO DE REGIONES PARA DEMANDA (Extraído de tu JSON)
-REGIONES_DEMANDA = {
-    "NEA": 418, "NOA": 419, "GBA": 426, "Centro": 422, "Patagonia": 111,
-    "Litoral": 417, "Comahue": 420, "Provincia_BSAS": 425, "Cuyo": 429,
-    "Edenor": 1077, "Edesur": 1078, "Edelap": 1943, "Santa_Fe": 2540,
-    "Misiones": 2426, "Entre_Rios": 2541, "Corrientes": 1893, "Chaco": 1892,
-    "Formosa": 1886, "Jujuy": 1937, "Salta": 1933, "Tucuman": 1936,
-    "Catamarca": 1938, "Santiago_del_Estero": 1905, "San_Luis": 1944,
-    "La_Rioja": 1910, "Cordoba": 1945, "San_Juan": 1922, "Mendoza": 1946,
-    "Rio_Negro": 2525, "La_Pampa": 427, "Chubut": 2543, "Santa_Cruz": 2542,
-    "Tierra_del_Fuego": 23, "Neuquen": 2528
+# Diccionarios de IDs (Tus IDs confirmados)
+REGIONES_DEM = {
+    "SADI": 1002, "NEA": 418, "NOA": 419, "GBA": 426, "Centro": 422, 
+    "Patagonia": 111, "Litoral": 417, "Comahue": 420, "Provincia_BSAS": 425, 
+    "Cuyo": 429, "Edenor": 1077, "Edesur": 1078, "Edelap": 1943
 }
-
-# 2. LISTADO DE REGIONES PARA GENERACIÓN (Solo las que permiten el endpoint)
-REGIONES_GENERACION = {
-    "NEA": 418, "NOA": 419, "GBA": 426, "Centro": 422, "Patagonia": 111,
-    "Litoral": 417, "Comahue": 420, "Provincia_BSAS": 425, "Cuyo": 429
+REGIONES_GEN = {
+    "SADI": 1002, "NEA": 418, "NOA": 419, "GBA": 426, "Centro": 422, 
+    "Patagonia": 111, "Litoral": 417, "Comahue": 420, "Provincia_BSAS": 425, "Cuyo": 429
 }
 
 def clean_val(val, default=0):
@@ -31,90 +24,68 @@ def clean_val(val, default=0):
         return val
     except: return default
 
-def fetch_data(endpoint_type, id_reg):
-    """endpoint_type puede ser 'demanda' o 'generacion'"""
+def fetch(path, id_reg):
     try:
-        if endpoint_type == "demanda":
-            url = f"{BASE_URL}demanda/ObtieneDemandaYTemperaturaRegion?id_region={id_reg}"
-        else:
-            url = f"{BASE_URL}generacion/ObtieneGeneracioEnergiaPorRegion?id_region={id_reg}"
-        
-        res = requests.get(url, timeout=15)
+        url = f"{BASE_URL}{path}?id_region={id_reg}"
+        res = requests.get(url, timeout=25)
         return res.json()
-    except:
-        return None
+    except: return None
 
 def actualizar_csv():
-    print(f"Iniciando captura masiva histórica: {datetime.now()}")
+    print(f"--- Iniciando Auditoría Histórica: {datetime.now()} ---")
     
-    # --- A. OBTENER SADI COMO MASTER TIMESTAMP ---
-    raw_sadi = fetch_data("demanda", 1002)
-    if not raw_sadi:
-        print("Error: No se pudo obtener el dato maestro del SADI.")
-        return
+    # 1. Obtener datos Master (SADI) - Toda la lista de hoy
+    raw_sadi = fetch("demanda/ObtieneDemandaYTemperaturaRegion", 1002)
+    if not raw_sadi: return
 
-    df_sadi = pd.DataFrame(raw_sadi).dropna(subset=['demHoy'])
-    if df_sadi.empty: return
+    # Crear DataFrame base con todos los puntos de tiempo de hoy
+    df_final = pd.DataFrame(raw_sadi).dropna(subset=['demHoy'])
+    df_final['fecha'] = pd.to_datetime(df_final['fecha']).dt.strftime("%Y-%m-%d %H:%M:%S")
     
-    u_sadi = df_sadi.iloc[-1]
-    fecha_key = pd.to_datetime(u_sadi['fecha']).strftime("%Y-%m-%d %H:%M:%S")
+    # Renombrar columnas base
+    df_final = df_final[['fecha', 'demHoy', 'demAyer', 'demSemanaAnt', 'demPrevista', 'tempHoy', 'tempAyer', 'tempSemanaAnt']]
+    df_final.columns = ['fecha', 'sadi_dem_hoy', 'sadi_dem_ayer', 'sadi_dem_sem_ant', 'sadi_dem_prevista', 'sadi_temp_hoy', 'sadi_temp_ayer', 'sadi_temp_sem_ant']
 
-    # --- B. CONSTRUIR FILA DE DATOS ---
-    nueva_fila = {
-        "fecha": fecha_key,
-        # Datos Core SADI
-        "sadi_dem_hoy": int(clean_val(u_sadi.get('demHoy'))),
-        "sadi_dem_ayer": int(clean_val(u_sadi.get('demAyer'))),
-        "sadi_dem_sem_ant": int(clean_val(u_sadi.get('demSemanaAnt'))),
-        "sadi_dem_prevista": int(clean_val(u_sadi.get('demPrevista'))),
-        "sadi_temp_hoy": float(clean_val(u_sadi.get('tempHoy'))),
-        "sadi_temp_ayer": float(clean_val(u_sadi.get('tempAyer'))),
-        "sadi_temp_sem_ant": float(clean_val(u_sadi.get('tempSemanaAnt')))
-    }
-
-    # --- C. RECOLECTAR DEMANDA REGIONAL / PROVINCIAL ---
-    print("Recolectando demandas regionales...")
-    for nombre, id_reg in REGIONES_DEMANDA.items():
-        raw = fetch_data("demanda", id_reg)
+    # 2. Integrar Demandas Regionales
+    for nombre, id_reg in REGIONES_DEM.items():
+        if nombre == "SADI": continue
+        raw = fetch("demanda/ObtieneDemandaYTemperaturaRegion", id_reg)
         if raw:
-            df_reg = pd.DataFrame(raw).dropna(subset=['demHoy'])
-            if not df_reg.empty:
-                last = df_reg.iloc[-1]
-                nueva_fila[f"dem_{nombre.lower()}_hoy"] = int(clean_val(last.get('demHoy')))
-                nueva_fila[f"dem_{nombre.lower()}_ayer"] = int(clean_val(last.get('demAyer')))
-                nueva_fila[f"dem_{nombre.lower()}_sem_ant"] = int(clean_val(last.get('demSemanaAnt')))
-                nueva_fila[f"temp_{nombre.lower()}_hoy"] = float(clean_val(last.get('tempHoy')))
+            df_reg = pd.DataFrame(raw)[['fecha', 'demHoy', 'tempHoy']]
+            df_reg['fecha'] = pd.to_datetime(df_reg['fecha']).dt.strftime("%Y-%m-%d %H:%M:%S")
+            df_reg.columns = ['fecha', f'dem_{nombre.lower()}_hoy', f'temp_{nombre.lower()}_hoy']
+            df_final = pd.merge(df_final, df_reg, on='fecha', how='left')
 
-    # --- D. RECOLECTAR GENERACIÓN REGIONAL ---
-    print("Recolectando matrices de generación...")
-    for nombre, id_reg in REGIONES_GENERACION.items():
-        raw = fetch_data("generacion", id_reg)
+    # 3. Integrar Generación Regional
+    for nombre, id_reg in REGIONES_GEN.items():
+        raw = fetch("generacion/ObtieneGeneracioEnergiaPorRegion", id_reg)
         if raw:
-            df_gen = pd.DataFrame(raw)
-            if not df_gen.empty:
-                last = df_gen.iloc[-1]
-                pfx = f"gen_{nombre.lower()}"
-                nueva_fila.update({
-                    f"{pfx}_total": int(clean_val(last.get('sumTotal'))),
-                    f"{pfx}_nuclear": int(clean_val(last.get('nuclear'))),
-                    f"{pfx}_renovable": int(clean_val(last.get('renovable'))),
-                    f"{pfx}_hidraulico": int(clean_val(last.get('hidraulico'))),
-                    f"{pfx}_termico": int(clean_val(last.get('termico'))),
-                    f"{pfx}_importacion": int(clean_val(last.get('importacion')))
-                })
+            df_gen = pd.DataFrame(raw)[['fecha', 'sumTotal', 'nuclear', 'renovable', 'hidraulico', 'termico', 'importacion']]
+            df_gen['fecha'] = pd.to_datetime(df_gen['fecha']).dt.strftime("%Y-%m-%d %H:%M:%S")
+            pfx = f"gen_{nombre.lower()}"
+            df_gen.columns = ['fecha', f'{pfx}_total', f'{pfx}_nuclear', f'{pfx}_renovable', f'{pfx}_hidraulico', f'{pfx}_termico', f'{pfx}_importacion']
+            df_final = pd.merge(df_final, df_gen, on='fecha', how='left')
 
-    # --- E. GUARDAR ---
-    if not os.path.isfile(FILE_NAME):
-        pd.DataFrame([nueva_fila]).to_csv(FILE_NAME, index=False)
-        print("✅ Base de datos histórica inicializada con éxito.")
-    else:
-        df_hist = pd.read_csv(FILE_NAME)
-        if fecha_key not in df_hist['fecha'].values:
-            df_hist = pd.concat([df_hist, pd.DataFrame([nueva_fila])], ignore_index=True)
-            df_hist.to_csv(FILE_NAME, index=False)
-            print(f"✅ Registro masivo guardado para {fecha_key}")
+    # Limpieza de nulos después de los merges
+    df_final = df_final.fillna(0)
+
+    # 4. Comparar con el CSV existente y rellenar
+    if os.path.isfile(FILE_NAME):
+        df_old = pd.read_csv(FILE_NAME)
+        # Filtramos solo lo que NO está en el archivo viejo
+        df_new_points = df_final[~df_final['fecha'].isin(df_old['fecha'])]
+        
+        if not df_new_points.empty:
+            df_updated = pd.concat([df_old, df_new_points], ignore_index=True)
+            # Ordenamos por fecha para que el historial sea coherente
+            df_updated = df_updated.sort_values('fecha')
+            df_updated.to_csv(FILE_NAME, index=False)
+            print(f"✅ Se rellenaron {len(df_new_points)} puntos faltantes.")
         else:
-            print("Dato ya existente en el archivo.")
+            print("☕ No hay datos nuevos para agregar.")
+    else:
+        df_final.to_csv(FILE_NAME, index=False)
+        print("📁 Archivo histórico creado desde cero con datos de hoy.")
 
 if __name__ == "__main__":
     actualizar_csv()
